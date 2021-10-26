@@ -79,6 +79,8 @@ ipython_config.py
 
 # pyenv
 .python-version
+pyvenv.cfg
+Scripts/
 
 # celery beat schedule file
 celerybeat-schedule
@@ -112,3 +114,6 @@ dmypy.json
 
 # Pyre type checker
 .pyre/
+
+# Test csv files
+*.csv
