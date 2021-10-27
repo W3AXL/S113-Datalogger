@@ -3,32 +3,37 @@ import argparse
 import datetime
 import struct
 import numpy
+from prefixed import Float
+import matplotlib.pyplot as plt
 
 # Add arguments and query
 parser = argparse.ArgumentParser()
 parser.add_argument("-p","--port",metavar="COM1",help="Serial device for communication with S113")
-parser.add_argument("-r","--recall",metavar="0",help="Data storage bin to query. 0 = current plot")
+parser.add_argument("-r","--recall",metavar="4",help="Query saved trace, don't run new sweep. (0 = last sweep on screen)")
+parser.add_argument("-f1","--freq-start",metavar="100M",help="Start frequency in Hz")
+parser.add_argument("-f2","--freq-stop",metavar="1G",help="Stop frequency in Hz")
 parser.add_argument("-v","--verbose",help="verbose logging",action="store_true")
 parser.add_argument("-f","--csvfile",metavar="file.csv",help="Save data to CSV file")
+parser.add_argument("-S","--show-plot",help="Show plot of retrieved data",action="store_true")
 
 # Parse arguments
 args = parser.parse_args()
 
 portNo = ""
-recall = 0
+recall = None
 verb = False
 file = None
+plot = False
 
-if not args.recall:
-    print("Defaulting to recall index 0 (current data)")
-else:
-    recall = int(args.recall)
-
+# Verify we have a port first
 if not args.port:
     print("ERROR: No serial port specified!")
     exit(1)
 else:
     portNo = args.port
+
+if args.recall:
+    recall = int(args.recall)
 
 if args.verbose:
     verb = True
@@ -36,10 +41,29 @@ if args.verbose:
 if args.csvfile:
     file = args.csvfile
 
+if args.show_plot:
+    plot = True
+
+if (not file) and (not plot):
+    print("ERROR: not showing plot or saving file. Nothing to do!")
+    exit(1)
+
 # Create serial port
 port = serial.Serial(portNo, 9600, serial.EIGHTBITS, serial.PARITY_NONE, serial.STOPBITS_ONE, timeout=5)
 
 # Functions
+
+def parseFreq(freqString):
+    """
+    Convert an SI string (100M, 3.2G, etc) to a float
+
+    Args:
+        freqString (string): number string
+
+    Returns:
+        float: float representation of number
+    """
+    return float(Float(freqString))
 
 def sendBytes(bytes):
     """
@@ -117,6 +141,142 @@ def setupSystem(cwMode=False, keyLock=False, backlight=False, unit="English", ca
     if 0xFF not in resp:
         print("Got error {} when sending control byte".format(resp))
 
+def setFrequency(start, stop):
+    """
+    Sets frequency span for sweep
+
+    Args:
+        start (int): start frequency in Hz
+        stop (int): stop frequency in Hz
+    """
+
+    # Convert ints to uint32 bytes
+    startBytes = struct.pack('>I', start)
+    stopBytes = struct.pack('>I', stop)
+
+    bytes = bytearray()
+
+    # Set freq command
+    bytes.append(0x02)
+    # Freq bytes
+    bytes.append(startBytes)
+    bytes.append(stopBytes)
+
+    # Send
+    sendBytes(bytes)
+
+    # Wait for reply
+    resp = port.read(1)
+
+    # Process
+    if 0xFF not in resp:
+        return False
+    else:
+        return True
+
+def setDomain(dtf=False, graph="SWR"):
+    """
+    Set domain format and graph type
+
+    Args:
+        dtf (bool, optional): Whether to use distance domain or frequency domain. Defaults to False.
+        graph (str, optional): SWR, RL (Return Loss), or IL (Insertion Loss). Defaults to "SWR".
+    """
+
+    bytes = bytearray()
+
+    # Set domain
+    bytes.append(0x03)
+
+    if dtf:
+        bytes.append(0x01)
+    else:
+        bytes.append(0x00)
+
+    if graph == "RL":
+        bytes.append(0x01)
+    elif graph == "IL":
+        bytes.append(0x02)
+    else:
+        bytes.append(0x00)
+
+    sendBytes(bytes)
+
+    resp = port.read(1)
+
+    if 0xFF not in resp:
+        return False
+    else:
+        return True
+
+def setScale(start, stop):
+    """
+    Sets y-axis scale of the graph. Numbers are always uint16. 1/1000th of a dB for RL/IL and 1/1000th of ratio for SWR
+
+    NOTE:   RL scale is 0 to 54000 (0.0 dB to 54.0 dB)
+            SWR scale is 1000 to 65535 (1.00 to 65.53)
+
+    Args:
+        start (uint16): Start value
+        stop (uint16): Stop value
+    """
+
+    # Convert ints to bytes
+    startBytes = struct.pack('>H', start)
+    stopBytes = struct.pack('>H', stop)
+
+    bytes = bytearray()
+
+    # Set scale command
+    bytes.append(0x04)
+
+    # Add numbers
+    bytes.append(startBytes)
+    bytes.append(stopBytes)
+
+    # Send
+    sendBytes(bytes)
+
+    resp = port.read(1)
+
+    if 0xFF not in resp:
+        return False
+    else:
+        return True
+
+def setTime():
+    """
+    Sets time/date of S113 based on current date/time of PC
+    """
+    
+    # Get time strings
+    curTime = datetime.datetime.now()
+    timeStr = curTime.strftime("%H:%M:%S")
+    dateStr = curTime.strftime("%m/%d/%y")
+
+    # Encode to ASCII bytes
+    time = timeStr.encode('ascii')
+    date = dateStr.encode('ascii')
+
+    bytes = bytearray()
+
+    # Command
+    bytes.append(0x08)
+
+    # Strings
+    bytes.append(time)
+    bytes.append(date)
+
+    # Send
+    sendBytes(bytes)
+
+    resp = port.read(1)
+
+    if 0xFF not in resp:
+        return False
+    else:
+        return True
+
 def recallData(idx):
     """
     Recall data from the S113 into the dataArray and then process it
@@ -124,6 +284,8 @@ def recallData(idx):
     Args:
         idx (int): saved data index. 0 is current sweep on screen
     """
+    
+    print("Recalling data in index {}".format(idx))
     
     # Query current status first to get sweep parameters
     sendBytes(0x14)
@@ -224,10 +386,10 @@ def recallData(idx):
         print("Frequency sweep")
 
     # Get frequency information
-    freqStart = float(struct.unpack('>I', resp[40:44])[0])/1e6
-    freqStop = float(struct.unpack('>I', resp[44:48])[0])/1e6
-    freqStep = float(struct.unpack('>I', resp[48:52])[0])/1e3
-    print("Sweep start: {} MHz, stop: {} MHz, step: {} kHz".format(freqStart, freqStop, freqStep))
+    freqStart = float(struct.unpack('>I', resp[40:44])[0])
+    freqStop = float(struct.unpack('>I', resp[44:48])[0])
+    freqStep = float(struct.unpack('>I', resp[48:52])[0])
+    print("Sweep start: {} Hz, stop: {} Hz, step: {} Hz".format(freqStart, freqStop, freqStep))
 
     # Get scale information
     scaleStart = float(struct.unpack('>H', resp[52:54])[0])
@@ -253,10 +415,23 @@ def recallData(idx):
     else:
         mode = 'SWR'
 
-    parseData(dataArray, freqStart, freqStop, scaleStart, scaleStop, mode)
+    parseData(dataArray, freqStart, freqStop, scaleStart, scaleStop, mode, show=plot, file=file)
 
 
-def parseData(data, freqStart, freqStop, scaleStart, scaleStop, mode="RL"):
+def parseData(data, freqStart, freqStop, scaleStart, scaleStop, mode="RL", show=False, file=None):
+    """
+    Parse gamma/phase data into RL or SWR and display/save to file
+
+    Args:
+        data (list): gamma/phase array
+        freqStart (uint32): start frequency in Hz
+        freqStop (uint32): stop frequency in Hz
+        scaleStart (uint16): start scale
+        scaleStop (uint16): stop scale
+        mode (str, optional): Return loss, Insertion Loss, SWR. Defaults to "RL".
+        show (bool): whether to show the matplotlib plot
+        file (string): whether to save to a file. Defaults to None
+    """
 
     # Calculate frequency bins
     freqs = numpy.arange(freqStart, freqStop, (freqStop - freqStart) / len(data))
@@ -265,9 +440,11 @@ def parseData(data, freqStart, freqStop, scaleStart, scaleStop, mode="RL"):
     gamma = numpy.array([i[0] for i in data])
     phase = numpy.array([i[1] for i in data])
 
-    # Calculate RL in dB and SWR
+    # Calculate RL in dB
     returnLoss = 20 * numpy.log10(gamma)
-    swr = (1 + gamma)/(1 - gamma)
+
+    # Calculate SWR, and handle divide by zero as max SWR
+    swr = numpy.divide(1 + gamma, 1 - gamma, out = (numpy.ones_like(gamma) * 65535), where=(1-gamma)!=0)
 
     # Save to CSV
     if file:
@@ -277,14 +454,63 @@ def parseData(data, freqStart, freqStop, scaleStart, scaleStop, mode="RL"):
         combined = numpy.vstack((freqs, returnLoss, phase, swr)).T
         # save
         numpy.savetxt(file, combined, delimiter=',', header="W3AXL S113 Sweep Data,\n{}\nFreq (MHz), Return Loss (dB), Phase (deg), SWR".format(timestamp), comments='')
+        print("Saved data to {}".format(file))
 
-    print ("Done processing")
+    # Show plot if specified
+    if show:
+    
+        # Setup plot params
+        plt.style.use('dark_background')
+        fig, ax1 = plt.subplots()
+        ax1.set_xlabel("Frequency (Hz)")
+
+        # Our graph depends on measurement format
+        if mode == "RL":
+            yBottom = float(scaleStop) / 1000.0
+            yTop = float(scaleStart) / 1000.0
+            data1 = returnLoss
+            data2 = phase
+            ax1.set_ylabel("Return Loss (dB)")
+            ax1.plot(freqs, data1)
+            ax1.set_ylim(yBottom, yTop)
+            ax1.margins(0)
+            ax2 = ax1.twinx()
+            ax2.set_ylabel("Phase (Deg)")
+            ax2.plot(freqs, data2)
+            ax2.margins(0)
+
+        elif mode == "SWR":
+            yBottom = float(scaleStart) / 1000.0
+            yTop = float(scaleStop) / 1000.0
+            data1 = swr
+            data2 = None
+            ax1.set_ylabel("SWR")
+            ax1.plot(freqs, data1)
+            ax1.set_ylim(yTop, yBottom)
+            ax1.margins(0)
+
+        # Common axis coloring
+        for ax in fig.get_axes():
+            ax.tick_params(color='lightgrey')
+            for spine in ax.spines.values():
+                spine.set_edgecolor('lightgrey')
+
+        fig.tight_layout()
+        plt.grid(color='grey', linestyle='-.', linewidth=0.5)
+        plt.show()
 
 # Main runtime
 if __name__ == "__main__":
+    # Connect and setup
     print("Connecting...")
     connect()
-    setupSystem(cwMode=True, keyLock=True, backlight=True, cal=True)
-    recallData(recall)
+    print("Connected!")
+    setupSystem(cwMode=True, keyLock=False, backlight=True, cal=True)
+
+    # Do something based on command line switches
+    if recall != None:
+        recallData(recall)
+        print("Done!")
+
     print("Disconnecting...")
     disconnect()
